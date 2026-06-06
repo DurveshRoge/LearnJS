@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import MonacoEditor from '@monaco-editor/react'
 import './App.css'
 
 type Topic = {
@@ -25,6 +26,13 @@ type TraceScenario = {
 }
 
 type Page = 'home' | 'roadmap' | 'topics' | 'quizzes' | 'editor' | 'visualizer'
+type EditorOutputLevel = 'log' | 'warn' | 'error'
+
+type EditorOutputEntry = {
+  id: number
+  level: EditorOutputLevel
+  message: string
+}
 
 const topics: Topic[] = [
   {
@@ -3093,17 +3101,37 @@ console.log("outside");`,
   },
 ]
 
-const editorStarter = `// Write your JavaScript code here
-console.log("Hello, JavaScript!");
-`
+const javascriptEditorDefault = `for(let i = 0; i < 5; i++){
+  console.log(i);
+}`
+const javascriptEditorStorageKey = 'learnjs.editor.javascript'
+
+function readStoredEditorValue(key: string, fallback: string) {
+  if (typeof window === 'undefined') return fallback
+  const storedValue = window.localStorage.getItem(key)
+  return storedValue ?? fallback
+}
+
+function formatOutputValue(value: unknown) {
+  if (typeof value === 'string') return value
+  if (typeof value === 'undefined') return 'undefined'
+  if (value instanceof Error) return value.stack || value.message
+
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return String(value)
+  }
+}
+
+function formatRuntimeError(error: unknown) {
+  if (error instanceof Error) return error.stack || error.message
+  return String(error)
+}
 
 function App() {
   const [page, setPage] = useState<Page>(() => getRouteFromHash())
   const [selectedTopic, setSelectedTopic] = useState(topics[0])
-  const [editorCode, setEditorCode] = useState(editorStarter)
-  const [editorOutput, setEditorOutput] = useState('Output will appear here.')
-  const [iframeSource, setIframeSource] = useState('')
-  const iframeRef = useRef<HTMLIFrameElement>(null)
   const [scenarioIndex, setScenarioIndex] = useState(0)
   const [stepIndex, setStepIndex] = useState(0)
   const [isPlaying, setIsPlaying] = useState(false)
@@ -3127,23 +3155,6 @@ function App() {
     return () => window.removeEventListener('hashchange', syncRoute)
   }, [])
 
-  useEffect(() => {
-    const handleMessage = (event: MessageEvent) => {
-      if (event.source !== iframeRef.current?.contentWindow) return
-      const data = event.data as { type?: string; lines?: string[]; message?: string }
-
-      if (data.type === 'editor-output') {
-        setEditorOutput(data.lines?.join('\n') || 'No output.')
-      }
-
-      if (data.type === 'editor-error') {
-        setEditorOutput(data.message || 'Something went wrong.')
-      }
-    }
-
-    window.addEventListener('message', handleMessage)
-    return () => window.removeEventListener('message', handleMessage)
-  }, [])
 
   useEffect(() => {
     if (!isPlaying) return
@@ -3171,48 +3182,6 @@ function App() {
     }, 0)
   }
 
-  const runEditorCode = () => {
-    setEditorOutput('Running...')
-    const source = `<!doctype html>
-<html>
-  <body>
-    <script>
-      const lines = [];
-      const print = (...args) => lines.push(args.map((item) => {
-        if (typeof item === 'string') return item;
-        try { return JSON.stringify(item); } catch { return String(item); }
-      }).join(' '));
-
-      console.log = print;
-      console.warn = (...args) => print('Warning:', ...args);
-      console.error = (...args) => print('Error:', ...args);
-
-      window.addEventListener('unhandledrejection', (event) => {
-        parent.postMessage({ type: 'editor-error', message: String(event.reason) }, '*');
-      });
-
-      try {
-        Promise.resolve()
-          .then(async () => {
-            ${editorCode}
-          })
-          .then(() => {
-            setTimeout(() => {
-              parent.postMessage({ type: 'editor-output', lines }, '*');
-            }, 25);
-          })
-          .catch((error) => {
-            parent.postMessage({ type: 'editor-error', message: error.stack || error.message || String(error) }, '*');
-          });
-      } catch (error) {
-        parent.postMessage({ type: 'editor-error', message: error.stack || error.message || String(error) }, '*');
-      }
-    </script>
-  </body>
-</html>`
-
-    setIframeSource(source)
-  }
 
   const selectScenario = (index: number) => {
     setScenarioIndex(index)
@@ -3265,16 +3234,7 @@ function App() {
 
       {page === 'quizzes' && <QuizzesPage />}
 
-      {page === 'editor' && (
-        <EditorPage
-          editorCode={editorCode}
-          editorOutput={editorOutput}
-          iframeRef={iframeRef}
-          iframeSource={iframeSource}
-          runEditorCode={runEditorCode}
-          setEditorCode={setEditorCode}
-        />
-      )}
+      {page === 'editor' && <EditorPage />}
 
       {page === 'visualizer' && (
         <VisualizerPage
@@ -3923,60 +3883,134 @@ function QuizzesPage() {
   )
 }
 
-function EditorPage({
-  editorCode,
-  editorOutput,
-  iframeRef,
-  iframeSource,
-  runEditorCode,
-  setEditorCode,
-}: {
-  editorCode: string
-  editorOutput: string
-  iframeRef: React.RefObject<HTMLIFrameElement | null>
-  iframeSource: string
-  runEditorCode: () => void
-  setEditorCode: (code: string) => void
-}) {
+function EditorPage() {
+  const [jsCode, setJsCode] = useState(() =>
+    readStoredEditorValue(javascriptEditorStorageKey, javascriptEditorDefault),
+  )
+  const [outputEntries, setOutputEntries] = useState<EditorOutputEntry[]>([])
+  const [autoRun, setAutoRun] = useState(false)
+  const outputIdRef = useRef(0)
+
+  useEffect(() => {
+    window.localStorage.setItem(javascriptEditorStorageKey, jsCode)
+  }, [jsCode])
+
+  const executeCode = () => {
+    const entries: EditorOutputEntry[] = []
+    let nextId = 0
+
+    const originalLog = console.log
+    const originalWarn = console.warn
+    const originalError = console.error
+
+    const capture = (level: EditorOutputLevel, ...args: unknown[]) => {
+      const message = args.map(formatOutputValue).join(' ')
+      entries.push({ id: nextId++, level, message })
+    }
+
+    console.log = (...args: unknown[]) => capture('log', ...args)
+    console.warn = (...args: unknown[]) => capture('warn', ...args)
+    console.error = (...args: unknown[]) => capture('error', ...args)
+
+    try {
+      // eslint-disable-next-line no-eval
+      eval(jsCode)
+    } catch (err: unknown) {
+      entries.push({ id: nextId++, level: 'error', message: formatRuntimeError(err) })
+    }
+
+    console.log = originalLog
+    console.warn = originalWarn
+    console.error = originalError
+
+    outputIdRef.current += entries.length
+    for (const entry of entries) entry.id += outputIdRef.current - entries.length
+    setOutputEntries(entries)
+  }
+
+  const clearOutput = () => {
+    setOutputEntries([])
+    outputIdRef.current = 0
+  }
+
+  useEffect(() => {
+    if (!autoRun) return
+    const timer = window.setTimeout(() => executeCode(), 300)
+    return () => window.clearTimeout(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoRun, jsCode])
+
   return (
     <section className="editor-section page-section page-view" id="editor">
       <div className="tool-heading">
-        <h2>Live Editor</h2>
+        <h2>JavaScript Playground</h2>
         <p>
-          Write JavaScript on the left, see the output on the right. Code runs
-          in a sandboxed iframe.
+          Write JavaScript code and run it directly. Console output and errors
+          appear in the panel on the right.
         </p>
       </div>
 
-      <div className="editor-layout">
-        <div className="code-panel">
-          <div className="panel-title">
-            <span>script.js</span>
-            <button className="run-button" type="button" onClick={runEditorCode}>
-              ▶ Run
-            </button>
+      <div className="js-playground">
+        <div className="js-editor-pane">
+          <div className="js-editor-bar">
+            <span className="js-pane-label">JavaScript</span>
+            <div className="js-editor-actions">
+              <label className="auto-run-toggle">
+                <input
+                  type="checkbox"
+                  checked={autoRun}
+                  onChange={(e) => setAutoRun(e.target.checked)}
+                />
+                Auto Run
+              </label>
+              <button className="run-button" type="button" onClick={executeCode}>
+                Run
+              </button>
+              <button className="ghost-control" type="button" onClick={clearOutput}>
+                Clear
+              </button>
+            </div>
           </div>
-          <textarea
-            aria-label="JavaScript editor"
-            spellCheck={false}
-            value={editorCode}
-            onChange={(event) => setEditorCode(event.target.value)}
-          />
+      
+          <div className="js-editor-body">
+            <MonacoEditor
+              height="100%"
+              language="javascript"
+              value={jsCode}
+              onChange={(v) => setJsCode(v ?? '')}
+              theme="vs-dark"
+              options={{
+                minimap: { enabled: false },
+                fontSize: 14,
+                wordWrap: 'on',
+                automaticLayout: true,
+                tabSize: 2,
+                scrollBeyondLastLine: false,
+              }}
+            />
+          </div>
         </div>
-
-        <div className="console-panel">
-          <div className="panel-title">Console</div>
-          <pre>{editorOutput}</pre>
+      
+        <div className="js-output-pane">
+          <div className="js-output-bar">
+            <span className="js-pane-label">Output</span>
+          </div>
+      
+          <div className="js-output-scroll">
+            {outputEntries.length === 0 ? (
+              <p className="js-output-empty">
+                Output is empty. Click Run to execute your code.
+              </p>
+            ) : (
+              outputEntries.map((entry) => (
+                <div key={entry.id} className={`js-output-line js-output-${entry.level}`}>
+                  {entry.message}
+                </div>
+              ))
+            )}
+          </div>
         </div>
       </div>
-
-      <iframe
-        ref={iframeRef}
-        title="Sandboxed JavaScript runner"
-        sandbox="allow-scripts"
-        srcDoc={iframeSource}
-        hidden
-      />
     </section>
   )
 }
